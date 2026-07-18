@@ -12,7 +12,7 @@ use collab_database::rows::{RowChange, RowId};
 use collab_database::views::{DatabaseViewChange, RowOrder};
 use dashmap::DashMap;
 use flowy_notification::{DebounceNotificationSender, NotificationBuilder};
-use futures::StreamExt;
+use futures::{StreamExt, future::join_all};
 
 use std::sync::Arc;
 use tracing::{error, trace, warn};
@@ -64,13 +64,23 @@ pub(crate) async fn observe_rows_change(
               let cell_id = format!("{}:{}", row_id, field_id);
               notify_cell(&notification_sender, &cell_id);
 
-              let views = editor.database.read().await.get_all_database_views_meta();
-              for view in views {
-                notify_row(&notification_sender, &view.id, &field_id, &row_id);
-                editor
-                  .did_update_row(&view.id, &row_id, &field_id, None)
-                  .await;
+              let view_ids = editor
+                .database
+                .read()
+                .await
+                .get_all_database_views_meta()
+                .into_iter()
+                .map(|view| view.id)
+                .collect::<Vec<_>>();
+              for view_id in &view_ids {
+                notify_row(&notification_sender, view_id, &field_id, &row_id);
               }
+              join_all(
+                view_ids
+                  .iter()
+                  .map(|view_id| editor.did_update_row(view_id, &row_id, &field_id, None)),
+              )
+              .await;
             },
             _ => {
               warn!("unhandled row change: {:?}", row_change);

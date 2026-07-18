@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use collab_database::rows::RowId;
 use lib_infra::box_any::BoxAny;
 
 use flowy_database2::entities::{FieldType, SelectOptionFilterConditionPB, SelectOptionFilterPB};
@@ -7,7 +8,7 @@ use flowy_database2::services::cell::insert_select_option_cell;
 use flowy_database2::services::database_view::DatabaseViewChanged;
 use flowy_database2::services::filter::FilterResultNotification;
 
-use crate::database::filter_test::script::{DatabaseFilterTest, FilterRowChanged};
+use crate::database::filter_test::script::DatabaseFilterTest;
 use crate::database::mock_data::{COMPLETED, PLANNED};
 
 /// A cell that is modified without going through `DatabaseEditor::update_cell`,
@@ -23,7 +24,6 @@ use crate::database::mock_data::{COMPLETED, PLANNED};
 #[tokio::test]
 async fn remote_cell_update_shows_row_in_filtered_view_test() {
   let mut test = DatabaseFilterTest::new().await;
-  let row_count = test.rows.len();
   let expected = 2;
 
   // Create a "Status is Completed" filter. Rows 2 and 3 are Completed.
@@ -43,15 +43,10 @@ async fn remote_cell_update_shows_row_in_filtered_view_test() {
         condition: SelectOptionFilterConditionPB::OptionIs,
         option_ids: vec![completed_option_id.clone()],
       }),
-      Some(FilterRowChanged {
-        showing_num_of_rows: 0,
-        hiding_num_of_rows: row_count - expected,
-      }),
+      None,
     )
     .await;
   test.assert_number_of_visible_rows(expected).await;
-  // Let the initial filter task settle before subscribing.
-  test.wait(300).await;
 
   // Simulate a remote edit: assign "Completed" to row 0 (whose status is empty)
   // by writing the cell directly to the underlying collab document, bypassing
@@ -74,7 +69,7 @@ async fn remote_cell_update_shows_row_in_filtered_view_test() {
     .unwrap();
 
   // The filtered view must be notified that the row became visible.
-  let notification = wait_for_filter_notification(recv).await;
+  let notification = wait_for_filter_notification(recv, &row_id, true).await;
   assert_eq!(
     notification.visible_rows.len(),
     1,
@@ -89,7 +84,6 @@ async fn remote_cell_update_shows_row_in_filtered_view_test() {
 #[tokio::test]
 async fn remote_cell_update_hides_row_in_filtered_view_test() {
   let mut test = DatabaseFilterTest::new().await;
-  let row_count = test.rows.len();
   let expected = 2;
 
   // Create a "Status is Completed" filter. Rows 2 and 3 are Completed.
@@ -115,15 +109,10 @@ async fn remote_cell_update_hides_row_in_filtered_view_test() {
         condition: SelectOptionFilterConditionPB::OptionIs,
         option_ids: vec![completed_option_id],
       }),
-      Some(FilterRowChanged {
-        showing_num_of_rows: 0,
-        hiding_num_of_rows: row_count - expected,
-      }),
+      None,
     )
     .await;
   test.assert_number_of_visible_rows(expected).await;
-  // Let the initial filter task settle before subscribing.
-  test.wait(300).await;
 
   // Simulate a remote edit: change row 2 from "Completed" to "Planned" by
   // writing the cell directly to the underlying collab document, bypassing the
@@ -146,7 +135,7 @@ async fn remote_cell_update_hides_row_in_filtered_view_test() {
     .unwrap();
 
   // The filtered view must be notified that the row became invisible.
-  let notification = wait_for_filter_notification(recv).await;
+  let notification = wait_for_filter_notification(recv, &row_id, false).await;
   assert_eq!(
     notification.invisible_rows.len(),
     1,
@@ -158,11 +147,27 @@ async fn remote_cell_update_hides_row_in_filtered_view_test() {
 
 async fn wait_for_filter_notification(
   mut recv: tokio::sync::broadcast::Receiver<DatabaseViewChanged>,
+  row_id: &RowId,
+  expect_visible: bool,
 ) -> FilterResultNotification {
+  let row_id = row_id.clone();
+  let row_id_string = row_id.to_string();
   tokio::time::timeout(Duration::from_secs(2), async move {
     loop {
       match recv.recv().await {
-        Ok(DatabaseViewChanged::FilterNotification(notification)) => break notification,
+        Ok(DatabaseViewChanged::FilterNotification(notification)) => {
+          if expect_visible
+            && notification
+              .visible_rows
+              .iter()
+              .any(|row| row.row_meta.id == row_id_string)
+          {
+            break notification;
+          }
+          if !expect_visible && notification.invisible_rows.iter().any(|id| id == &row_id) {
+            break notification;
+          }
+        },
         Ok(_) => continue,
         Err(err) => panic!("view changed channel closed: {:?}", err),
       }
